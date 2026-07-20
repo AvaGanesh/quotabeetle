@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,9 +22,14 @@ func main() {
 	reservationTimeout := envDuration("RESERVATION_TIMEOUT", 60*time.Second)
 	refillInterval := envDuration("REFILL_INTERVAL", 1*time.Second)
 
-	client, err := tb.NewClient(tb.ToUint128(clusterID), []string{address})
+	resolvedAddress, err := resolveAddress(address)
 	if err != nil {
-		log.Fatalf("connect to tigerbeetle at %s: %v", address, err)
+		log.Fatalf("resolve tigerbeetle address %s: %v", address, err)
+	}
+
+	client, err := tb.NewClient(tb.ToUint128(clusterID), []string{resolvedAddress})
+	if err != nil {
+		log.Fatalf("connect to tigerbeetle at %s (%s): %v", address, resolvedAddress, err)
 	}
 	defer client.Close()
 
@@ -54,6 +61,31 @@ func runRefillLoop(ledger *ratelimit.Ledger, interval time.Duration) {
 			log.Printf("refill: topped up %d bucket(s)", n)
 		}
 	}
+}
+
+// resolveAddress turns a host:port into an ip:port. TigerBeetle's client
+// requires a literal IP address and rejects hostnames outright (e.g. Docker
+// Compose service names like "tigerbeetle:3000"), so any non-IP host is
+// resolved via DNS here first.
+func resolveAddress(address string) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+	if net.ParseIP(host) != nil {
+		return address, nil
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("lookup %s: %w", host, err)
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			return net.JoinHostPort(ip4.String(), port), nil
+		}
+	}
+	return net.JoinHostPort(ips[0].String(), port), nil
 }
 
 func envString(key, def string) string {

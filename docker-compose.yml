@@ -1,0 +1,48 @@
+services:
+  tigerbeetle-format:
+    image: ghcr.io/tigerbeetle/tigerbeetle:latest
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - tigerbeetle-data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        test -f /data/0_0.tigerbeetle ||
+        /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 --development /data/0_0.tigerbeetle
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:latest
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - IPC_LOCK
+    depends_on:
+      tigerbeetle-format:
+        condition: service_completed_successfully
+    volumes:
+      - tigerbeetle-data:/data
+    command: ["start", "--addresses=0.0.0.0:3000", "--development", "/data/0_0.tigerbeetle"]
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3000"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  ratelimiter:
+    build: .
+    depends_on:
+      tigerbeetle:
+        condition: service_healthy
+    environment:
+      TB_ADDRESS: tigerbeetle:3000
+      PORT: 8080
+      REFILL_INTERVAL: 1s
+      RESERVATION_TIMEOUT: 60s
+    ports:
+      - "8080:8080"
+
+volumes:
+  tigerbeetle-data:
