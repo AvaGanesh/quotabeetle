@@ -64,6 +64,19 @@ curl localhost:8080/v1/keys/demo/balance
 
 To wipe local cluster state and start fresh: `scripts/dev-tigerbeetle.sh --reset`.
 
+### Or with Docker
+
+```bash
+docker compose up -d
+```
+
+This builds the service image, formats a single-replica TigerBeetle data file into a named volume (`tigerbeetle-format`, a one-shot init step that's a no-op on subsequent runs), starts TigerBeetle (`tigerbeetle`, healthchecked with `nc`), then starts the service (`ratelimiter`) once TigerBeetle is healthy. The API is on `localhost:8080`, TigerBeetle on `localhost:3000`.
+
+Notes:
+- The `Dockerfile` needs a C toolchain to build (`tigerbeetle-go` uses cgo to link TigerBeetle's prebuilt native client library), hence the `golang:1.23-bookworm` build stage rather than an Alpine one.
+- TigerBeetle's client requires a literal IP, not a hostname — it rejects Compose service names like `tigerbeetle:3000` outright. `cmd/ratelimiter` resolves `TB_ADDRESS` via DNS before connecting, so both `TB_ADDRESS=tigerbeetle:3000` (Docker) and `TB_ADDRESS=127.0.0.1:3000` (local) work.
+- `docker compose down -v` removes the TigerBeetle data volume; plain `down` preserves it across restarts.
+
 ## HTTP API
 
 | Method | Path | Body | Description |
