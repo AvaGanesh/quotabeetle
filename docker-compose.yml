@@ -33,6 +33,13 @@ services:
 
   ratelimiter:
     build: .
+    # tigerbeetle-go links the same native tb_client library as the
+    # tigerbeetle image, which needs io_uring - blocked by Docker's default
+    # seccomp profile on some hosts (observed in GitHub Actions runners,
+    # though not on Docker Desktop's Linux VM). Needs the same seccomp
+    # exemption the official image documents.
+    security_opt:
+      - seccomp:unconfined
     depends_on:
       tigerbeetle:
         condition: service_healthy
