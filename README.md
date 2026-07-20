@@ -1,6 +1,18 @@
-# api-ratelimiter
+# quotabeetle
+
+[![CI](https://github.com/AvaGanesh/quotabeetle/actions/workflows/ci.yml/badge.svg)](https://github.com/AvaGanesh/quotabeetle/actions/workflows/ci.yml)
+[![Go Reference](https://img.shields.io/github/go-mod/go-version/AvaGanesh/quotabeetle)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/docker-compose%20up-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
 
 A token-bucket API rate limiter / quota service backed by [TigerBeetle](https://tigerbeetle.com) as the ledger. Instead of counters in Redis, quota is money: each API key is an account, each request is a two-phase transfer, and TigerBeetle's single-writer-per-account consensus is what guarantees no double-spend under concurrency — no locking required on our side.
+
+- **Language/runtime agnostic** — it's a standalone HTTP service; call it from anything that can make an HTTP request.
+- **Atomic under concurrency** — TigerBeetle serializes transfers per account, so no locks or Lua scripts are needed to avoid double-spend.
+- **Two-phase by design** — reserve capacity up front, commit or void once you know the outcome, instead of guessing the cost before you've done the work.
+- **Real token bucket** — a background refill loop replenishes each key at its own rate, capped at its own burst capacity.
+- **Runs in one command** — `docker compose up -d` gets you the service, TigerBeetle, and formatting/healthchecks wired together.
+- **Documented** — interactive API docs at `/docs` (OpenAPI 3, see [`internal/httpapi/openapi.yaml`](internal/httpapi/openapi.yaml)).
 
 ## How it works
 
@@ -24,6 +36,8 @@ internal/ratelimit/    Ledger: wraps the TigerBeetle client with domain operatio
                         plus a reusable net/http Middleware for Go services
                         that want to embed quota checks directly.
 internal/httpapi/      The standalone HTTP service — what other languages/services call.
+                        openapi.yaml is the OpenAPI 3 spec, embedded into the
+                        binary and served live at /openapi.yaml and /docs.
 scripts/                dev-tigerbeetle.sh: installs and runs a single-replica dev cluster.
 test/                   Integration tests proving no double-spend and correct refill behavior.
 ```
@@ -40,7 +54,7 @@ scripts/dev-tigerbeetle.sh &
 go run ./cmd/ratelimiter
 ```
 
-Try it:
+Then open [`localhost:8080/docs`](http://localhost:8080/docs) for interactive API docs, or try it from the command line:
 
 ```bash
 # Provision a key: bucket holds up to 5 tokens, refilling by 1 every tick (REFILL_INTERVAL, default 1s)
@@ -79,6 +93,8 @@ Notes:
 
 ## HTTP API
 
+Full interactive docs (Swagger UI) are served by the running app at **`/docs`** — e.g. `http://localhost:8080/docs` — backed by the OpenAPI 3 spec at `/openapi.yaml`. The same spec lives in the repo at [`internal/httpapi/openapi.yaml`](internal/httpapi/openapi.yaml) if you want to import it into Postman/Insomnia or generate a client without running the service.
+
 | Method | Path | Body | Description |
 |---|---|---|---|
 | `POST` | `/v1/keys` | `{"api_key", "capacity", "refill_per_interval"}` | Provision a key's bucket (starts full); a no-op if the key already exists with the same config |
@@ -87,8 +103,11 @@ Notes:
 | `POST` | `/v1/quota/reservations/{id}/commit` | `{"amount"?}` | Finalize a reservation (optionally for less than reserved) |
 | `POST` | `/v1/quota/reservations/{id}/void` | – | Release a reservation, restoring its tokens |
 | `GET` | `/healthz` | – | Liveness check |
+| `GET` | `/docs` / `/openapi.yaml` | – | Swagger UI / raw OpenAPI 3 spec |
 
 Status codes: `reserve` returns `429` when the bucket is empty and `404` for an unknown key; `POST /v1/keys` returns `409` if the key already exists with a *different* `capacity`/`refill_per_interval` (both are immutable after creation); `commit`/`void` return `404` if the reservation doesn't exist, `409` if it already expired or was already settled.
+
+**No built-in authentication** — `api_key` is a quota identifier, not a credential. This is meant to run on a trusted internal network (e.g. only reachable by other backend services); put a gateway or network policy in front of it for anything more exposed.
 
 ### Using it as a Go middleware
 

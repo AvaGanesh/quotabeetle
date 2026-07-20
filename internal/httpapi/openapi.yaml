@@ -1,0 +1,392 @@
+openapi: 3.0.3
+info:
+  title: quotabeetle
+  description: >
+    A token-bucket API rate limiter / quota service backed by TigerBeetle.
+    Each API key is a bucket of tokens; each request reserves tokens with a
+    two-phase (pending) transfer, then the caller commits (spends) or voids
+    (releases) it once the downstream work's outcome is known. A background
+    loop refills every bucket by its configured rate, capped at its
+    capacity.
+
+
+    **No authentication**: this service has no auth of its own - `api_key`
+    is a quota identifier, not a credential. It's meant to be deployed on a
+    trusted internal network (e.g. only reachable by other backend
+    services), with network policy or a gateway providing access control.
+  version: "1.0"
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    url: https://github.com/AvaGanesh/quotabeetle
+externalDocs:
+  description: Project README (design notes, Go middleware usage, self-hosting)
+  url: https://github.com/AvaGanesh/quotabeetle#readme
+
+security: []
+
+servers:
+  - url: http://localhost:8080
+    description: Local / docker compose
+
+tags:
+  - name: keys
+    description: Provisioning and inspecting an API key's token bucket
+  - name: quota
+    description: Reserving and settling quota for individual requests
+  - name: meta
+    description: Service liveness
+
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      summary: Liveness check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: The service is up.
+
+  /v1/keys:
+    post:
+      tags: [keys]
+      summary: Provision an API key's token bucket
+      description: >
+        Creates the key's bucket with the given capacity (burst size) and
+        refill_per_interval (tokens added per background refill tick). The
+        bucket starts full. capacity and refill_per_interval are fixed at
+        creation: calling this again for the same key with the *same*
+        values is a no-op (created=false); calling it with *different*
+        values returns 409.
+      operationId: createKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateKeyRequest"
+      responses:
+        "201":
+          description: Key created and its bucket filled to capacity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateKeyResponse"
+        "200":
+          description: Key already existed with the same capacity/refill_per_interval (no-op).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateKeyResponse"
+        "400":
+          description: api_key or capacity missing/zero.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Key already exists with a different capacity or refill_per_interval.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/keys/{apiKey}/balance:
+    get:
+      tags: [keys]
+      summary: Inspect a key's current bucket state
+      operationId: getBalance
+      parameters:
+        - $ref: "#/components/parameters/ApiKeyPathParam"
+      responses:
+        "200":
+          description: Current bucket state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceResponse"
+        "404":
+          description: Unknown API key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/quota/reserve:
+    post:
+      tags: [quota]
+      summary: Atomically check-and-decrement a key's bucket
+      description: >
+        Reserves cost tokens (default 1) from the key's bucket with a
+        pending (two-phase) transfer. This is not final spend: call commit
+        or void on the returned reservation_id once the outcome of the work
+        it's guarding is known. Unsettled reservations auto-expire after
+        timeout_seconds.
+      operationId: reserveQuota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReserveRequest"
+      responses:
+        "200":
+          description: Reserved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReserveResponse"
+              example:
+                allowed: true
+                reservation_id: "19f7f876348d9ac26b7e678162ac07f"
+                timeout_seconds: 60
+        "429":
+          description: Bucket does not have enough available tokens.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReserveResponse"
+              example:
+                allowed: false
+                reason: quota_exceeded
+        "404":
+          description: Unknown API key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/quota/reservations/{id}/commit:
+    post:
+      tags: [quota]
+      summary: Finalize a reservation, permanently spending its tokens
+      operationId: commitReservation
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPathParam"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SettleRequest"
+      responses:
+        "200":
+          description: Committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettleResponse"
+              example:
+                status: committed
+        "400":
+          description: Invalid reservation id, or amount exceeds what was reserved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Reservation not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Reservation already expired or already settled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/quota/reservations/{id}/void:
+    post:
+      tags: [quota]
+      summary: Release a reservation, restoring its tokens to the bucket
+      operationId: voidReservation
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPathParam"
+      responses:
+        "200":
+          description: Voided.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettleResponse"
+              example:
+                status: voided
+        "400":
+          description: Invalid reservation id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Reservation not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Reservation already expired or already settled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  parameters:
+    ApiKeyPathParam:
+      name: apiKey
+      in: path
+      required: true
+      schema:
+        type: string
+      example: demo
+    ReservationIdPathParam:
+      name: id
+      in: path
+      required: true
+      description: The reservation_id returned by POST /v1/quota/reserve, as a hex string.
+      schema:
+        type: string
+      example: "19f7f876348d9ac26b7e678162ac07f"
+
+  responses:
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    CreateKeyRequest:
+      type: object
+      required: [api_key, capacity]
+      properties:
+        api_key:
+          type: string
+          example: demo
+        capacity:
+          type: integer
+          format: uint64
+          description: Bucket burst size - the most tokens it can ever hold.
+          minimum: 1
+          example: 5
+        refill_per_interval:
+          type: integer
+          format: uint32
+          description: >
+            Tokens added to the bucket per background refill tick (see the
+            server's REFILL_INTERVAL, default 1s). 0 disables automatic
+            refill, leaving a static quota.
+          default: 0
+          example: 1
+
+    CreateKeyResponse:
+      type: object
+      properties:
+        api_key:
+          type: string
+        capacity:
+          type: integer
+          format: uint64
+        refill_per_interval:
+          type: integer
+          format: uint32
+        created:
+          type: boolean
+          description: false if the key already existed with this exact configuration.
+
+    BalanceResponse:
+      type: object
+      properties:
+        api_key:
+          type: string
+        capacity:
+          type: integer
+          format: uint64
+        refill_per_interval:
+          type: integer
+          format: uint32
+        tokens:
+          type: integer
+          format: uint64
+          description: Total tokens ever granted to this bucket (monotonically increasing; not "currently available").
+        used:
+          type: integer
+          format: uint64
+          description: Tokens permanently spent via committed reservations.
+        pending:
+          type: integer
+          format: uint64
+          description: Tokens held by reservations that are neither committed nor voided yet.
+        available:
+          type: integer
+          format: uint64
+          description: tokens - used - pending. What a new reserve call can still draw from.
+
+    ReserveRequest:
+      type: object
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          example: demo
+        cost:
+          type: integer
+          format: uint64
+          description: Tokens to reserve. Defaults to 1 if omitted or 0.
+          default: 1
+          example: 1
+
+    ReserveResponse:
+      type: object
+      properties:
+        allowed:
+          type: boolean
+        reservation_id:
+          type: string
+          description: Present only when allowed=true. Pass to the commit/void endpoints.
+        timeout_seconds:
+          type: integer
+          format: uint32
+          description: Present only when allowed=true. Seconds before this reservation auto-expires if left unsettled.
+        reason:
+          type: string
+          description: Present only when allowed=false.
+          enum: [quota_exceeded]
+
+    SettleRequest:
+      type: object
+      properties:
+        amount:
+          type: integer
+          format: uint64
+          description: >
+            Commit only: post less than the full reserved amount, releasing
+            the remainder back to the bucket. Omit to post the full amount.
+            Not used by void.
+
+    SettleResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [committed, voided]
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string

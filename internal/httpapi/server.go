@@ -1,5 +1,7 @@
 // Package httpapi exposes internal/ratelimit as an HTTP service so that
-// services in any language can check-and-decrement quota over the network:
+// services in any language can check-and-decrement quota over the network.
+// The full API is documented as an OpenAPI 3 spec in openapi.yaml, served
+// live (along with a Swagger UI) at /openapi.yaml and /docs.
 //
 //	POST /v1/keys                                  provision a key's token bucket (capacity + refill rate)
 //	GET  /v1/keys/{apiKey}/balance                 inspect current bucket state
@@ -36,6 +38,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	s.mux.HandleFunc("GET /docs", s.handleDocs)
+	s.mux.HandleFunc("GET /openapi.yaml", s.handleOpenAPISpec)
 	s.mux.HandleFunc("POST /v1/keys", s.handleCreateKey)
 	s.mux.HandleFunc("GET /v1/keys/{apiKey}/balance", s.handleBalance)
 	s.mux.HandleFunc("POST /v1/quota/reserve", s.handleReserve)
