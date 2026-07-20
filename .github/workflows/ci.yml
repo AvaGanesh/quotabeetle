@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for the service to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8080/healthz; then
+              echo "service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "service never became healthy" >&2
+          docker compose logs
+          exit 1
+
+      - name: Smoke test the token-bucket API
+        run: |
+          set -e
+          curl -sf -X POST localhost:8080/v1/keys \
+            -H 'content-type: application/json' \
+            -d '{"api_key":"ci-smoke","capacity":2,"refill_per_interval":1}'
+          echo
+          reserve="$(curl -sf -X POST localhost:8080/v1/quota/reserve \
+            -H 'content-type: application/json' \
+            -d '{"api_key":"ci-smoke","cost":1}')"
+          echo "$reserve"
+          echo "$reserve" | grep -q '"allowed":true'
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
