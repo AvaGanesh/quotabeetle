@@ -1,13 +1,16 @@
 package httpapi
 
 type createKeyRequest struct {
-	APIKey string `json:"api_key"`
-	Quota  uint64 `json:"quota"`
+	APIKey            string `json:"api_key"`
+	Capacity          uint64 `json:"capacity"`
+	RefillPerInterval uint32 `json:"refill_per_interval"`
 }
 
 type createKeyResponse struct {
-	APIKey  string `json:"api_key"`
-	Granted uint64 `json:"granted"`
+	APIKey            string `json:"api_key"`
+	Capacity          uint64 `json:"capacity"`
+	RefillPerInterval uint32 `json:"refill_per_interval"`
+	Created           bool   `json:"created"`
 }
 
 type reserveRequest struct {
@@ -31,11 +34,13 @@ type settleResponse struct {
 }
 
 type balanceResponse struct {
-	APIKey    string `json:"api_key"`
-	Granted   uint64 `json:"granted"`
-	Used      uint64 `json:"used"`
-	Pending   uint64 `json:"pending"`
-	Available uint64 `json:"available"`
+	APIKey            string `json:"api_key"`
+	Capacity          uint64 `json:"capacity"`
+	RefillPerInterval uint32 `json:"refill_per_interval"`
+	Tokens            uint64 `json:"tokens"`
+	Used              uint64 `json:"used"`
+	Pending           uint64 `json:"pending"`
+	Available         uint64 `json:"available"`
 }
 
 type errorResponse struct {

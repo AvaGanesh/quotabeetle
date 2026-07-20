@@ -1,8 +1,8 @@
 // Package httpapi exposes internal/ratelimit as an HTTP service so that
 // services in any language can check-and-decrement quota over the network:
 //
-//	POST /v1/keys                                  provision/top-up a key's quota
-//	GET  /v1/keys/{apiKey}/balance                 inspect current balance
+//	POST /v1/keys                                  provision a key's token bucket (capacity + refill rate)
+//	GET  /v1/keys/{apiKey}/balance                 inspect current bucket state
 //	POST /v1/quota/reserve                         reserve capacity (two-phase pending transfer)
 //	POST /v1/quota/reservations/{id}/commit        finalize a reservation
 //	POST /v1/quota/reservations/{id}/void          release a reservation
@@ -52,17 +52,32 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.APIKey == "" || req.Quota == 0 {
-		writeError(w, http.StatusBadRequest, "api_key and a non-zero quota are required")
+	if req.APIKey == "" || req.Capacity == 0 {
+		writeError(w, http.StatusBadRequest, "api_key and a non-zero capacity are required")
 		return
 	}
 
-	if _, err := s.ledger.Grant(req.APIKey, req.Quota); err != nil {
-		log.Printf("grant failed: %v", err)
-		writeError(w, http.StatusInternalServerError, "failed to grant quota")
+	created, err := s.ledger.CreateKey(req.APIKey, req.Capacity, req.RefillPerInterval)
+	if err != nil {
+		if errors.Is(err, ratelimit.ErrKeyConfigMismatch) {
+			writeError(w, http.StatusConflict, "key already exists with a different capacity or refill_per_interval")
+			return
+		}
+		log.Printf("create key failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to create key")
 		return
 	}
-	writeJSON(w, http.StatusCreated, createKeyResponse{APIKey: req.APIKey, Granted: req.Quota})
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, createKeyResponse{
+		APIKey:            req.APIKey,
+		Capacity:          req.Capacity,
+		RefillPerInterval: req.RefillPerInterval,
+		Created:           created,
+	})
 }
 
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
@@ -80,11 +95,13 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, balanceResponse{
-		APIKey:    apiKey,
-		Granted:   balance.Granted,
-		Used:      balance.Used,
-		Pending:   balance.Pending,
-		Available: balance.Available,
+		APIKey:            apiKey,
+		Capacity:          balance.Capacity,
+		RefillPerInterval: balance.RefillPerInterval,
+		Tokens:            balance.Tokens,
+		Used:              balance.Used,
+		Pending:           balance.Pending,
+		Available:         balance.Available,
 	})
 }
 

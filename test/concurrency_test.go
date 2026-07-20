@@ -24,7 +24,7 @@ import (
 	"github.com/avaganesh/api-ratelimiter/internal/ratelimit"
 )
 
-func newTestServer(t *testing.T) *httptest.Server {
+func newTestServer(t *testing.T) (*httptest.Server, *ratelimit.Ledger) {
 	t.Helper()
 
 	address := os.Getenv("TB_ADDRESS")
@@ -45,7 +45,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 	srv := httptest.NewServer(httpapi.New(ledger))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, ledger
 }
 
 func uniqueKey(t *testing.T) string {
@@ -92,14 +92,14 @@ func getJSON(t *testing.T, client *http.Client, url string) (int, map[string]any
 // exactly the granted amount succeeds - proving TigerBeetle's per-account
 // serialization prevents double-spend under contention.
 func TestConcurrentReserve_NoDoubleSpend(t *testing.T) {
-	srv := newTestServer(t)
+	srv, _ := newTestServer(t)
 	client := srv.Client()
 	key := uniqueKey(t)
 
 	const quota = 100
 	const workers = 300
 
-	if status, body := postJSON(t, client, srv.URL+"/v1/keys", map[string]any{"api_key": key, "quota": quota}); status != http.StatusCreated {
+	if status, body := postJSON(t, client, srv.URL+"/v1/keys", map[string]any{"api_key": key, "capacity": quota, "refill_per_interval": 0}); status != http.StatusCreated {
 		t.Fatalf("create key: status=%d body=%v", status, body)
 	}
 
@@ -155,13 +155,13 @@ func TestConcurrentReserve_NoDoubleSpend(t *testing.T) {
 // voids - and only that capacity - becomes available for new reservations,
 // again fired concurrently.
 func TestConcurrentReserveCommitVoid_ReclaimsCapacity(t *testing.T) {
-	srv := newTestServer(t)
+	srv, _ := newTestServer(t)
 	client := srv.Client()
 	key := uniqueKey(t)
 
 	const quota = 50
 
-	if status, body := postJSON(t, client, srv.URL+"/v1/keys", map[string]any{"api_key": key, "quota": quota}); status != http.StatusCreated {
+	if status, body := postJSON(t, client, srv.URL+"/v1/keys", map[string]any{"api_key": key, "capacity": quota, "refill_per_interval": 0}); status != http.StatusCreated {
 		t.Fatalf("create key: status=%d body=%v", status, body)
 	}
 
@@ -240,5 +240,86 @@ func TestConcurrentReserveCommitVoid_ReclaimsCapacity(t *testing.T) {
 	// The reclaimed reservations from the second wave are still pending (uncommitted).
 	if pending := balance["pending"]; pending != float64(voided) {
 		t.Fatalf("expected pending=%d, got %v", voided, pending)
+	}
+}
+
+// TestRefillReplenishesCapacity proves the external refill loop implements
+// token-bucket semantics: draining a bucket denies further requests, a
+// Refill tick tops it back up by the configured amount, the refilled tokens
+// are actually spendable, and repeated refills never push the bucket past
+// capacity even when it wasn't fully drained in between.
+func TestRefillReplenishesCapacity(t *testing.T) {
+	srv, ledger := newTestServer(t)
+	client := srv.Client()
+	key := uniqueKey(t)
+
+	const capacity = 5
+	const refillPerInterval = 3
+
+	if status, body := postJSON(t, client, srv.URL+"/v1/keys", map[string]any{
+		"api_key": key, "capacity": capacity, "refill_per_interval": refillPerInterval,
+	}); status != http.StatusCreated {
+		t.Fatalf("create key: status=%d body=%v", status, body)
+	}
+
+	// Drain the bucket completely.
+	for i := 0; i < capacity; i++ {
+		status, body := postJSON(t, client, srv.URL+"/v1/quota/reserve", map[string]any{"api_key": key, "cost": 1})
+		if status != http.StatusOK {
+			t.Fatalf("drain reserve %d: status=%d body=%v", i, status, body)
+		}
+		reservationID, _ := body["reservation_id"].(string)
+		if s, b := postJSON(t, client, fmt.Sprintf("%s/v1/quota/reservations/%s/commit", srv.URL, reservationID), nil); s != http.StatusOK {
+			t.Fatalf("drain commit %d: status=%d body=%v", i, s, b)
+		}
+	}
+	if status, body := postJSON(t, client, srv.URL+"/v1/quota/reserve", map[string]any{"api_key": key, "cost": 1}); status != http.StatusTooManyRequests {
+		t.Fatalf("expected drained bucket to deny further reserves, got status=%d body=%v", status, body)
+	}
+
+	// One refill tick should top the bucket up by refillPerInterval.
+	if _, err := ledger.Refill(); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	status, balance := getJSON(t, client, srv.URL+"/v1/keys/"+key+"/balance")
+	if status != http.StatusOK {
+		t.Fatalf("balance: status=%d", status)
+	}
+	if available := balance["available"]; available != float64(refillPerInterval) {
+		t.Fatalf("expected available=%d after one refill, got %v", refillPerInterval, available)
+	}
+
+	// The refilled tokens must actually be spendable, and only that many.
+	// Leave this one reserved (don't commit) so it can be voided below to
+	// get back to a known available=refillPerInterval baseline.
+	status, body := postJSON(t, client, srv.URL+"/v1/quota/reserve", map[string]any{"api_key": key, "cost": refillPerInterval})
+	if status != http.StatusOK {
+		t.Fatalf("reserve after refill: status=%d body=%v", status, body)
+	}
+	if ok, _ := body["allowed"].(bool); !ok {
+		t.Fatalf("expected refilled tokens to be reservable, got %v", body)
+	}
+	reservationID, _ := body["reservation_id"].(string)
+	if status, body := postJSON(t, client, srv.URL+"/v1/quota/reserve", map[string]any{"api_key": key, "cost": 1}); status != http.StatusTooManyRequests {
+		t.Fatalf("expected bucket to be drained again, got status=%d body=%v", status, body)
+	}
+	if s, b := postJSON(t, client, fmt.Sprintf("%s/v1/quota/reservations/%s/void", srv.URL, reservationID), nil); s != http.StatusOK {
+		t.Fatalf("void: status=%d body=%v", s, b)
+	}
+
+	// Back to available=refillPerInterval=3 (used=capacity=5, nothing
+	// pending). Refilling again from here must cap at capacity: headroom is
+	// only capacity-available=2, less than refillPerInterval=3, so exactly
+	// 2 tokens should be added, not 3 - proving the cap actually engages
+	// rather than just happening to land under capacity by coincidence.
+	if _, err := ledger.Refill(); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	status, balance = getJSON(t, client, srv.URL+"/v1/keys/"+key+"/balance")
+	if status != http.StatusOK {
+		t.Fatalf("balance: status=%d", status)
+	}
+	if available := balance["available"]; available != float64(capacity) {
+		t.Fatalf("expected capped refill to bring available to capacity=%d, got %v", capacity, available)
 	}
 }
